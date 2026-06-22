@@ -28,6 +28,11 @@
 #define ST_FAN_OFF  0x00
 #define ST_FAN_ON   0x01
 
+// --------- Константы режима Burst для nRF905 ---------
+#define BURST_COUNT    6    // Количество повторов одного пакета
+#define BURST_PAUSE_MS 5    // Пауза между повторами (мс) — даёт приёмнику
+                            // время вернуться в RX-режим (nRF905: < 650 мкс)
+
 // [FIX 7] Именованные константы для смещений в пакете ZH07B
 // Источник: ZH07B datasheet, раздел "Output data format", стандартная атмосфера
 #define ZH07_PM25_HIGH  6
@@ -557,56 +562,92 @@ void loop() {
 
 // ---------------------------------------------------------------------------
 // Сборка и отправка бинарного пакета
-// ---------------------------------------------------------------------------
+// ============================================================
+//  Структура пакета ПОСЛЕ изменения (18 байт, было 17):
+//
+//  Байт  0    : burst_id          — ID серии (дедупликация на приёмнике)
+//  Байт  1    : heater_status
+//  Байт  2    : fan_status
+//  Байты 3–4  : temperature (int16_t, × 100)
+//  Байты 5–6  : humidity    (uint16_t, × 100)
+//  Байты 7–8  : UV-index    (uint16_t, × 100)
+//  Байты 9–12 : Lux         (uint32_t, × 100)
+//  Байты 13–14: PM2.5       (uint16_t, × 10)
+//  Байты 15–16: PM10        (uint16_t, × 10)
+//  Байт  17   : CRC XOR (покрывает байты 0–16, включая burst_id)
+// ============================================================
 void sendBinaryPacket() {
-  // [FIX 9] Не отправляем пакет при невалидных данных T/H.
-  // isnan возвращает true если SHT31 отвалился и avgT/avgH не обновлялись.
+  // Пропускаем отправку при невалидных данных T/H
   if (isnan(avgT) || isnan(avgH)) {
     Serial.println("[TX] Пропуск пакета: невалидные данные T/H");
     return;
   }
-
+ 
+  // Счётчик серии. static — сохраняется между вызовами функции.
+  // uint8_t автоматически обнуляется при переполнении (255 → 0).
+  // Все BURST_COUNT копий одного пакета имеют одинаковый burst_id,
+  // поэтому приёмник легко отбрасывает дубликаты.
+  static uint8_t burst_id = 0;
+ 
   uint8_t buf[32];
   size_t  pos = 0;
-
-  // Байт 0: статус нагревателя
+ 
+  // Байт 0: ID серии
+  buf[pos++] = burst_id;
+ 
+  // Байт 1: статус нагревателя
   uint8_t heater_status = ST_NORMAL;
   if      (dryer_active)    heater_status = ST_HEATER;
   else if (cooldown_active) heater_status = ST_COOLING;
   buf[pos++] = heater_status;
-
-  // Байт 1: статус вентилятора
+ 
+  // Байт 2: статус вентилятора
   buf[pos++] = fan_active ? ST_FAN_ON : ST_FAN_OFF;
-
-  // Данные: упаковка с фиксированной точкой
+ 
+  // Упаковка данных с фиксированной точкой
   int16_t  t_packed    = (int16_t)round(avgT   * 100.0f);
   uint16_t h_packed    = (uint16_t)(avgH   * 100.0f + 0.5f);
   uint16_t uv_packed   = (uint16_t)(avgUV  * 100.0f + 0.5f);
   uint32_t lux_packed  = (uint32_t)(avgLux * 100.0f + 0.5f);
   uint16_t pm25_packed = (uint16_t)(lastPM25 * 10.0f + 0.5f);
   uint16_t pm10_packed = (uint16_t)(lastPM10 * 10.0f + 0.5f);
-
-  // [FIX 6] Явное приведение (uint16_t) для t_packed устраняет
-  // предупреждение компилятора "-Wconversion int16_t → uint16_t".
-  // На приёмной стороне (ESP32) читается обратно как int16_t — корректно.
+ 
   pack16(buf + pos, (uint16_t)t_packed);  pos += 2;
   pack16(buf + pos, h_packed);            pos += 2;
   pack16(buf + pos, uv_packed);           pos += 2;
   pack32(buf + pos, lux_packed);          pos += 4;
   pack16(buf + pos, pm25_packed);         pos += 2;
   pack16(buf + pos, pm10_packed);         pos += 2;
-
+ 
+  // CRC покрывает все байты включая burst_id (байт 0)
   buf[pos++] = calcChecksum(buf, pos);
-
-  // Отладочный дамп в HEX
-  Serial.print("[TX] BINARY: ");
+ 
+  // Отладочный вывод — один раз на всю серию
+  Serial.print("[TX] burst_id=");
+  Serial.print(burst_id);
+  Serial.print(" x");
+  Serial.print(BURST_COUNT);
+  Serial.print("  HEX: ");
   for (size_t i = 0; i < pos; i++) {
     if (buf[i] < 0x10) Serial.print('0');
     Serial.print(buf[i], HEX);
     Serial.print(' ');
   }
   Serial.println();
-
-  driver.send(buf, pos);
-  driver.waitPacketSent();
+ 
+  // ── Burst Transmission ──────────────────────────────────────
+  // Отправляем один и тот же пакет BURST_COUNT раз подряд.
+  // При попадании помехи на один из повторов остальные доходят.
+  // Общее время серии: 6 × (≈2 мс TX + 5 мс пауза) ≈ 42 мс —
+  // пренебрежимо мало по сравнению с 10-секундным циклом основного цикла.
+  for (uint8_t i = 0; i < BURST_COUNT; i++) {
+    driver.send(buf, pos);
+    driver.waitPacketSent();
+    if (i < BURST_COUNT - 1) {
+      delay(BURST_PAUSE_MS);
+    }
+  }
+ 
+  // Инкремент: следующая серия получит другой ID
+  burst_id++;
 }
